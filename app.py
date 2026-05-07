@@ -71,6 +71,28 @@ def fmt_tf(num, den, var="s"):
     return rf"\dfrac{{{fmt_poly(num, var)}}}{{{fmt_poly(den, var)}}}"
 
 
+def fmt_complex(c, dec=4):
+    """Complex number → string. Trata parte imaginária ~0 como real."""
+    c = complex(c)
+    if abs(c.imag) < 1e-8:
+        return f"{c.real:.{dec}f}"
+    sign = "+" if c.imag >= 0 else "-"
+    return f"{c.real:.{dec}f} {sign} {abs(c.imag):.{dec}f}j"
+
+
+def fmt_dist_label(root, dec=4):
+    """Rótulo LaTeX para |s_d - root|, preferindo +/- compactos quando real."""
+    root = complex(root)
+    if abs(root.imag) < 1e-8:
+        r = root.real
+        if abs(r) < 1e-10:
+            return r"|s_d|"
+        if r < 0:
+            return rf"|s_d + {(-r):.{dec}g}|"
+        return rf"|s_d - {r:.{dec}g}|"
+    return rf"|s_d - ({fmt_complex(root, dec)})|"
+
+
 # ---------------------------------------------------------------------------
 # Sidebar — preset selector
 # ---------------------------------------------------------------------------
@@ -285,6 +307,9 @@ except Exception as e:
     st.error(f"Erro no projeto: {e}")
     st.stop()
 
+# Captura ganho de projeto antes do multiplicador (útil no Passo 5)
+Kc_design = r["a"] if topologia == "apb" else r["Kc"]
+
 # Aplicar multiplicador de Kc / ganho
 if topologia == "apb":
     r["a"] *= mult_Kc
@@ -335,13 +360,77 @@ with st.expander("Passo 1 — Especificações e polo dominante $s_d$", expanded
     st.markdown(f"$s_d = {sd.real:.4f} + {sd.imag:.4f}\\,j$")
 
 
-with st.expander("Passo 2 — $G(s_d)\\cdot H(s_d)$", expanded=True):
+with st.expander("Passo 2 — $G(s_d)\\cdot H(s_d)$ e decomposição angular", expanded=True):
     GH = r["GH_sd"]
     st.latex(r"G(s_d)\,H(s_d) = " +
              f"{GH.real:.4f}{'+' if GH.imag >= 0 else '-'}{abs(GH.imag):.4f}\\,j")
     st.markdown(
         f"Módulo: $|G\\cdot H|_{{s_d}} = {r['M_GH']:.4g}$  "
         f"&nbsp;&nbsp; Ângulo: $\\angle G\\cdot H |_{{s_d}} = {r['ang_GH']:.4f}^\\circ$"
+    )
+
+    # Decomposição angular da malha aberta Gc·G·H
+    n_OL, d_OL = lgr.tf_mul(
+        *lgr.tf_mul(numG, denG, numH, denH),
+        r["Gc_num"], r["Gc_den"],
+    )
+    zeros_OL = np.roots(n_OL) if len(n_OL) > 1 else np.array([], dtype=complex)
+    poles_OL = np.roots(d_OL) if len(d_OL) > 1 else np.array([], dtype=complex)
+    K_lead_OL = float(n_OL[0]) / float(d_OL[0])
+
+    st.markdown("**Decomposição angular** da malha aberta "
+                "$G_c(s)\\,G(s)\\,H(s)$ — ângulo de cada vetor "
+                "$s_d - \\text{singularidade}$:")
+    rows = []
+    soma_z, soma_p = 0.0, 0.0
+    for z in zeros_OL:
+        v = sd - z
+        ang = float(np.degrees(np.angle(v)))
+        soma_z += ang
+        rows.append({
+            "Tipo": "zero",
+            "Valor": fmt_complex(z),
+            "sd − valor": fmt_complex(v),
+            "|sd − valor|": f"{abs(v):.4f}",
+            "Ângulo (°)": f"{ang:+.4f}",
+        })
+    for p in poles_OL:
+        v = sd - p
+        ang = float(np.degrees(np.angle(v)))
+        soma_p += ang
+        rows.append({
+            "Tipo": "polo",
+            "Valor": fmt_complex(p),
+            "sd − valor": fmt_complex(v),
+            "|sd − valor|": f"{abs(v):.4f}",
+            "Ângulo (°)": f"{ang:+.4f}",
+        })
+    df_decomp = pd.DataFrame(rows)
+    st.dataframe(df_decomp, use_container_width=True, hide_index=True)
+
+    ang_K_lead = 0.0 if K_lead_OL >= 0 else 180.0
+    total_bruto = ang_K_lead + soma_z - soma_p
+    total_norm = ((total_bruto + 180.0) % 360.0) - 180.0
+    ang_OL_tf = float(np.degrees(np.angle(lgr.tf_eval(n_OL, d_OL, sd))))
+    diff_circ = ((total_norm - ang_OL_tf + 180.0) % 360.0) - 180.0
+
+    nota_lead = (
+        f" + $\\angle K_g$ = {ang_K_lead:.0f}°"
+        if K_lead_OL < 0 else ""
+    )
+    st.markdown(
+        f"$\\sum$ ângulos zeros = **{soma_z:+.4f}°**, "
+        f"$\\sum$ ângulos polos = **{soma_p:+.4f}°**"
+        + (f", $K_g = {K_lead_OL:.4g} < 0$" if K_lead_OL < 0 else "")
+    )
+    st.markdown(
+        f"**Total** = ($\\sum$z − $\\sum$p){nota_lead} = "
+        f"{total_bruto:+.4f}° ≡ **{total_norm:+.4f}°** (mod 360°)"
+    )
+    st.markdown(
+        f"Conferência via `tf_eval`: "
+        f"$\\angle G_c G H |_{{s_d}} = {ang_OL_tf:+.4f}^\\circ$ "
+        f"(diferença circular: {diff_circ:+.2e}°)"
     )
 
 
@@ -400,9 +489,95 @@ with st.expander("Passo 4 — Posição do zero/polo do controlador", expanded=T
 
 
 with st.expander("Passo 5 — Ganho", expanded=True):
+    nome_K = "a" if topologia == "apb" else "K_c"
+
+    # ---- Forma fatorada (LGR) — pelo critério do módulo ----
+    if topologia == "P":
+        ctrl_num, ctrl_den = np.array([1.0]), np.array([1.0])
+    elif topologia == "PD":
+        ctrl_num, ctrl_den = np.array([1.0, r["z"]]), np.array([1.0])
+    elif topologia == "PI":
+        ctrl_num, ctrl_den = np.array([1.0, r["z"]]), np.array([1.0, 0.0])
+    elif topologia == "PID_zigual":
+        zz = r["z1"]
+        ctrl_num = np.array([1.0, 2.0 * zz, zz * zz])
+        ctrl_den = np.array([1.0, 0.0])
+    elif topologia == "apb":
+        ctrl_num, ctrl_den = np.array([1.0]), np.array([1.0, r["b"]])
+
+    n_L, d_L = lgr.tf_mul(
+        *lgr.tf_mul(numG, denG, numH, denH),
+        ctrl_num, ctrl_den,
+    )
+    zeros_L = np.roots(n_L) if len(n_L) > 1 else np.array([], dtype=complex)
+    poles_L = np.roots(d_L) if len(d_L) > 1 else np.array([], dtype=complex)
+    K_lead_L = float(n_L[0]) / float(d_L[0])
+
+    st.markdown("**Forma fatorada (critério do módulo do LGR):**")
+    if abs(K_lead_L - 1.0) < 1e-10:
+        st.latex(rf"{nome_K} = "
+                 r"\dfrac{\prod_j |s_d + p_j|}{\prod_k |s_d + z_k|}")
+    else:
+        st.latex(rf"{nome_K} = "
+                 r"\dfrac{\prod_j |s_d + p_j|}"
+                 r"{K_g \cdot \prod_k |s_d + z_k|}"
+                 rf",\quad K_g = {K_lead_L:.4g}")
+
+    # Distâncias |sd - sing| para cada polo/zero
+    zeros_dist = [abs(sd - z) for z in zeros_L]
+    polos_dist = [abs(sd - p) for p in poles_L]
+
+    if zeros_L.size:
+        linhas_z = "  \n".join(
+            f"&nbsp;&nbsp;${fmt_dist_label(z)} = {abs(sd - z):.4f}$"
+            for z in zeros_L
+        )
+        st.markdown(f"Zeros de $L = G_c\\,G\\,H / {nome_K}$:  \n" + linhas_z)
+    else:
+        st.markdown(f"$L = G_c\\,G\\,H / {nome_K}$ não tem zeros finitos.")
+
+    if poles_L.size:
+        linhas_p = "  \n".join(
+            f"&nbsp;&nbsp;${fmt_dist_label(p)} = {abs(sd - p):.4f}$"
+            for p in poles_L
+        )
+        st.markdown(f"Polos de $L$:  \n" + linhas_p)
+    else:
+        st.markdown("$L$ não tem polos finitos.")
+
+    prod_pol = float(np.prod(polos_dist)) if polos_dist else 1.0
+    prod_zer = float(np.prod(zeros_dist)) if zeros_dist else 1.0
+
+    if polos_dist:
+        s_pol = " \\cdot ".join(f"{d:.4f}" for d in polos_dist)
+        st.latex(rf"\textstyle\prod_j |s_d + p_j| = {s_pol} = {prod_pol:.4f}")
+    if zeros_dist:
+        s_zer = " \\cdot ".join(f"{d:.4f}" for d in zeros_dist)
+        st.latex(rf"\textstyle\prod_k |s_d + z_k| = {s_zer} = {prod_zer:.4f}")
+
+    Kc_factor = prod_pol / (K_lead_L * prod_zer)
+    if abs(K_lead_L - 1.0) < 1e-10:
+        st.latex(rf"{nome_K} = \dfrac{{{prod_pol:.4f}}}{{{prod_zer:.4f}}} "
+                 rf"= {Kc_factor:.6g}")
+    else:
+        st.latex(rf"{nome_K} = \dfrac{{{prod_pol:.4f}}}"
+                 rf"{{{K_lead_L:.4g} \cdot {prod_zer:.4f}}} "
+                 rf"= {Kc_factor:.6g}")
+
+    if abs(Kc_factor - Kc_design) > 1e-6 * max(abs(Kc_design), 1.0):
+        st.warning(
+            f"Discrepância vs. via tf_eval: fatorado = {Kc_factor:.6g}, "
+            f"projeto = {Kc_design:.6g}."
+        )
+
+    st.markdown("---")
+
+    # ---- Forma compacta original (via tf_eval) ----
+    st.markdown("**Forma compacta** (via $|G\\cdot H|_{s_d}$ direto):")
     if topologia == "apb":
         st.latex(r"a = \dfrac{|s_d + b|}{|G(s_d)\,H(s_d)|}")
-        st.markdown(f"$a = {r['a']:.4f}$" + (f" (× mult. {mult_Kc:.2f})" if mult_Kc != 1.0 else ""))
+        st.markdown(f"$a = {r['a']:.6g}$"
+                    + (f" (× mult. {mult_Kc:.2f})" if mult_Kc != 1.0 else ""))
     else:
         if topologia == "P":
             st.latex(r"K_c = \dfrac{1}{|G(s_d)\,H(s_d)|}")
@@ -412,7 +587,8 @@ with st.expander("Passo 5 — Ganho", expanded=True):
             st.latex(r"K_c = \dfrac{|s_d|}{|s_d+z|\cdot |GH(s_d)|}")
         elif topologia == "PID_zigual":
             st.latex(r"K_c = \dfrac{|s_d|}{|s_d+z|^2\cdot |GH(s_d)|}")
-        st.markdown(f"$K_c = {r['Kc']:.6g}$" + (f" (× mult. {mult_Kc:.2f})" if mult_Kc != 1.0 else ""))
+        st.markdown(f"$K_c = {r['Kc']:.6g}$"
+                    + (f" (× mult. {mult_Kc:.2f})" if mult_Kc != 1.0 else ""))
 
 
 with st.expander("Passo 6 — Equação final do controlador", expanded=True):
